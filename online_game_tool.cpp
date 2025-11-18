@@ -35,6 +35,13 @@ ISteamNetworkingSockets* m_pInterface = nullptr;
 bool forwarding = false;
 std::unique_ptr<TCPServer> server;
 
+// Connection config for improved P2P reliability
+SteamNetworkingConfigValue_t g_connectionConfig[2];
+int g_retryCount = 0;
+const int MAX_RETRIES = 3;
+CSteamID g_hostSteamID;
+int g_currentVirtualPort = 0;
+
 // New variables for multiple connections and TCP clients
 std::vector<HSteamNetConnection> connections;
 std::map<HSteamNetConnection, TCPClient*> clientMap;
@@ -43,11 +50,23 @@ int localPort = 0;
 bool g_isHost = false;
 bool g_isClient = false;
 
+// User info structure
+struct UserInfo {
+    CSteamID steamID;
+    std::string name;
+    int ping;
+    bool isRelay;
+};
+std::map<HSteamNetConnection, UserInfo> userMap;
+
 // Callback function for connection status changes
 void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t *pInfo)
 {
     std::lock_guard<std::mutex> lock(clientMutex);
-    std::cout << "Connection status changed: " << pInfo->m_info.m_eState << std::endl;
+    std::cout << "Connection status changed: " << pInfo->m_info.m_eState << " for connection " << pInfo->m_hConn << std::endl;
+    if (pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally) {
+        std::cout << "Connection failed: " << pInfo->m_info.m_szEndDebug << std::endl;
+    }
     if (pInfo->m_eOldState == k_ESteamNetworkingConnectionState_None && pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_Connecting)
     {
         // Incoming connection, accept it
@@ -55,7 +74,19 @@ void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t
         connections.push_back(pInfo->m_hConn);
         g_hConnection = pInfo->m_hConn; // Keep for backward compatibility if needed
         g_isConnected = true;
-        std::cout << "Accepted incoming connection" << std::endl;
+        std::cout << "Accepted incoming connection from " << pInfo->m_info.m_identityRemote.GetSteamID().ConvertToUint64() << std::endl;
+        // Add user info
+        SteamNetConnectionInfo_t info;
+        SteamNetConnectionRealTimeStatus_t status;
+        if (m_pInterface->GetConnectionInfo(pInfo->m_hConn, &info) && m_pInterface->GetConnectionRealTimeStatus(pInfo->m_hConn, &status, 0, nullptr)) {
+            UserInfo userInfo;
+            userInfo.steamID = pInfo->m_info.m_identityRemote.GetSteamID();
+            userInfo.name = SteamFriends()->GetFriendPersonaName(userInfo.steamID);
+            userInfo.ping = status.m_nPing;
+            userInfo.isRelay = (info.m_idPOPRelay != 0);
+            userMap[pInfo->m_hConn] = userInfo;
+            std::cout << "Incoming connection details: ping=" << status.m_nPing << "ms, relay=" << (info.m_idPOPRelay != 0 ? "yes" : "no") << std::endl;
+        }
         // Removed: Create TCP Client here - now lazy connect on first message
     }
     else if (pInfo->m_eOldState == k_ESteamNetworkingConnectionState_Connecting && pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_Connected)
@@ -63,6 +94,18 @@ void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t
         // Client connected successfully
         g_isConnected = true;
         std::cout << "Connected to host" << std::endl;
+        // Add user info
+        SteamNetConnectionInfo_t info;
+        SteamNetConnectionRealTimeStatus_t status;
+        if (m_pInterface->GetConnectionInfo(pInfo->m_hConn, &info) && m_pInterface->GetConnectionRealTimeStatus(pInfo->m_hConn, &status, 0, nullptr)) {
+            UserInfo userInfo;
+            userInfo.steamID = pInfo->m_info.m_identityRemote.GetSteamID();
+            userInfo.name = SteamFriends()->GetFriendPersonaName(userInfo.steamID);
+            userInfo.ping = status.m_nPing;
+            userInfo.isRelay = (info.m_idPOPRelay != 0);
+            userMap[pInfo->m_hConn] = userInfo;
+            std::cout << "Outgoing connection details: ping=" << status.m_nPing << "ms, relay=" << (info.m_idPOPRelay != 0 ? "yes" : "no") << std::endl;
+        }
     }
     else if (pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer || pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally)
     {
@@ -78,6 +121,8 @@ void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t
                 ++it;
             }
         }
+        // Remove from userMap
+        userMap.erase(pInfo->m_hConn);
         // Cleanup TCP Client
         if (clientMap.count(pInfo->m_hConn)) {
             clientMap[pInfo->m_hConn]->disconnect();
@@ -86,6 +131,21 @@ void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t
             std::cout << "Cleaned up TCP Client for connection" << std::endl;
         }
         std::cout << "Connection closed" << std::endl;
+
+        // Retry connection if client and retries left
+        if (g_isClient && !g_isConnected && g_retryCount < MAX_RETRIES) {
+            g_retryCount++;
+            g_currentVirtualPort++;
+            SteamNetworkingIdentity identity;
+            identity.SetSteamID(g_hostSteamID);
+            HSteamNetConnection newConn = m_pInterface->ConnectP2P(identity, g_currentVirtualPort, 2, g_connectionConfig);
+            if (newConn != k_HSteamNetConnection_Invalid) {
+                g_hConnection = newConn;
+                std::cout << "Retrying connection attempt " << g_retryCount << " with virtual port " << g_currentVirtualPort << std::endl;
+            } else {
+                std::cerr << "Failed to initiate retry connection" << std::endl;
+            }
+        }
     }
 }
 
@@ -93,11 +153,14 @@ void SteamFriendsCallbacks::OnGameRichPresenceJoinRequested(GameRichPresenceJoin
     CSteamID hostSteamID = pCallback->m_steamIDFriend;
     if (!g_isHost && !g_isConnected) {
         g_isClient = true;
+        g_hostSteamID = hostSteamID;
+        g_retryCount = 0;
+        g_currentVirtualPort = 0;
         SteamNetworkingIdentity identity;
         identity.SetSteamID(hostSteamID);
-        g_hConnection = m_pInterface->ConnectP2P(identity, 0, 0, nullptr);
+        g_hConnection = m_pInterface->ConnectP2P(identity, g_currentVirtualPort, 2, g_connectionConfig);
         if (g_hConnection != k_HSteamNetConnection_Invalid) {
-            std::cout << "Joined game room via invite from " << hostSteamID.ConvertToUint64() << std::endl;
+            std::cout << "Joined game room via invite from " << hostSteamID.ConvertToUint64() << ", attempting connection with virtual port " << g_currentVirtualPort << std::endl;
             // Start TCP Server
             server = std::make_unique<TCPServer>(8888);
             if (!server->start()) {
@@ -124,6 +187,10 @@ int main() {
     SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged(OnSteamNetConnectionStatusChanged);
 
     m_pInterface = SteamNetworkingSockets();
+
+    // Initialize connection config for better P2P reliability
+    g_connectionConfig[0].SetInt32(k_ESteamNetworkingConfig_TimeoutInitial, 10000); // 10 seconds initial timeout
+    g_connectionConfig[1].SetInt32(k_ESteamNetworkingConfig_NagleTime, 0); // Disable Nagle for UDP
 
     // Initialize GLFW
     if (!glfwInit()) {
@@ -187,6 +254,21 @@ int main() {
         // Poll networking
         m_pInterface->RunCallbacks();
 
+        // Update user info
+        {
+            std::lock_guard<std::mutex> lock(clientMutex);
+            for (auto conn : connections) {
+                SteamNetConnectionInfo_t info;
+                SteamNetConnectionRealTimeStatus_t status;
+                if (m_pInterface->GetConnectionInfo(conn, &info) && m_pInterface->GetConnectionRealTimeStatus(conn, &status, 0, nullptr)) {
+                    if (userMap.count(conn)) {
+                        userMap[conn].ping = status.m_nPing;
+                        userMap[conn].isRelay = (info.m_idPOPRelay != 0);
+                    }
+                }
+            }
+        }
+
         // Receive messages from Steam and forward to TCP server
         {
             std::lock_guard<std::mutex> lock(clientMutex);
@@ -241,11 +323,14 @@ int main() {
                 hListenSock = m_pInterface->CreateListenSocketP2P(0, 0, nullptr);
                 if (hListenSock != k_HSteamListenSocket_Invalid) {
                     g_isHost = true;
+                    std::cout << "Created listen socket for hosting game room" << std::endl;
                     // Set Rich Presence
                     std::string connectStr = std::to_string(SteamUser()->GetSteamID().ConvertToUint64());
                     SteamFriends()->SetRichPresence("connect", connectStr.c_str());
                     SteamFriends()->SetRichPresence("status", "主持游戏房间");
                     std::cout << "Hosting game room. Connection string: " << connectStr << std::endl;
+                } else {
+                    std::cerr << "Failed to create listen socket for hosting" << std::endl;
                 }
             }
             ImGui::InputText("主机Steam ID", joinBuffer, IM_ARRAYSIZE(joinBuffer));
@@ -253,11 +338,15 @@ int main() {
                 uint64 hostID = std::stoull(joinBuffer);
                 CSteamID hostSteamID(hostID);
                 g_isClient = true;
+                g_hostSteamID = hostSteamID;
+                g_retryCount = 0;
+                g_currentVirtualPort = 0;
                 // Connect to host
                 SteamNetworkingIdentity identity;
                 identity.SetSteamID(hostSteamID);
-                g_hConnection = m_pInterface->ConnectP2P(identity, 0, 0, nullptr);
+                g_hConnection = m_pInterface->ConnectP2P(identity, g_currentVirtualPort, 2, g_connectionConfig);
                 if (g_hConnection != k_HSteamNetConnection_Invalid) {
+                    std::cout << "Attempting to connect to host " << hostSteamID.ConvertToUint64() << " with virtual port " << g_currentVirtualPort << std::endl;
                     // Connection initiated, wait for callback to confirm
                     std::cout << "Connecting to host..." << std::endl;
                     // Start TCP Server
@@ -304,6 +393,27 @@ int main() {
                 std::lock_guard<std::mutex> lock(clientMutex);
                 ImGui::Text("连接的好友: %d", (int)connections.size());
                 ImGui::Text("活跃的TCP客户端: %d", (int)clientMap.size());
+            }
+            ImGui::Separator();
+            ImGui::Text("用户列表:");
+            if (ImGui::BeginTable("UserTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("名称");
+                ImGui::TableSetupColumn("延迟 (ms)");
+                ImGui::TableSetupColumn("连接类型");
+                ImGui::TableHeadersRow();
+                {
+                    std::lock_guard<std::mutex> lock(clientMutex);
+                    for (const auto& pair : userMap) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", pair.second.name.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%d", pair.second.ping);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", pair.second.isRelay ? "中继" : "直连");
+                    }
+                }
+                ImGui::EndTable();
             }
             ImGui::End();
         }
